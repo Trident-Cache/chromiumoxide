@@ -658,11 +658,19 @@ pub struct FrameNavigationRequest {
 
 impl FrameNavigationRequest {
     pub fn new(id: NavigationId, req: Request) -> Self {
-        Self {
-            id,
-            req,
-            timeout: Duration::from_millis(REQUEST_TIMEOUT),
-        }
+        Self::with_timeout(id, req, Duration::from_millis(REQUEST_TIMEOUT))
+    }
+
+    /// Like [`FrameNavigationRequest::new`], but bounded by `timeout` rather
+    /// than the crate-wide [`REQUEST_TIMEOUT`] default.
+    ///
+    /// The frame manager's navigation watcher is a second deadline, separate
+    /// from the one on the command future: `FrameManager::poll` fails the
+    /// navigation once `now > deadline` even though the command itself is
+    /// still within its own budget. Both have to honour the configuration or
+    /// raising `request_timeout` moves the failure without removing it.
+    pub fn with_timeout(id: NavigationId, req: Request, timeout: Duration) -> Self {
+        Self { id, req, timeout }
     }
 
     /// This will set the id of the frame into the `params` `frameId` field.

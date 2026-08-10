@@ -60,6 +60,37 @@ impl<T: Command> CommandFuture<T> {
             _marker: PhantomData,
         })
     }
+
+    /// Like [`CommandFuture::new`], but bounded by `timeout` instead of the
+    /// crate-wide [`crate::handler::REQUEST_TIMEOUT`] default.
+    ///
+    /// `BrowserConfig::request_timeout` already governs the command chains the
+    /// handler builds and the eviction of stale pending commands, but every
+    /// future created here used the constant regardless — so a caller that
+    /// raised the configured timeout still had each individual command fail at
+    /// 30 seconds.
+    pub fn with_timeout(
+        cmd: T,
+        target_sender: mpsc::Sender<TargetMessage>,
+        session: Option<SessionId>,
+        timeout: std::time::Duration,
+    ) -> Result<Self> {
+        let (tx, rx_command) = oneshot_channel::<Result<Response>>();
+        let method = cmd.identifier();
+
+        let message = Some(TargetMessage::Command(CommandMessage::with_session(
+            cmd, tx, session,
+        )?));
+
+        Ok(Self {
+            target_sender,
+            rx_command,
+            message,
+            delay: futures_timer::Delay::new(timeout),
+            method,
+            _marker: PhantomData,
+        })
+    }
 }
 
 impl<T> Future for CommandFuture<T>
