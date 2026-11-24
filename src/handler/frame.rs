@@ -132,7 +132,13 @@ impl Frame {
     }
 
     fn on_loading_started(&mut self) {
-        self.lifecycle_events.clear();
+        // Only `init` begins a new document, and it clears the lifecycle
+        // events itself (see `on_page_lifecycle_event`), as Puppeteer does.
+        // `frameStartedLoading` also comes for a same-document navigation,
+        // a single-page app's `history.replaceState`, and can arrive after
+        // the document's `load` and its last `frameStoppedLoading`. Erasing
+        // `load` there left the frame unloaded for good: Chrome sends nothing
+        // more for that document, and the navigation waited out its timeout.
         self.http_request.take();
     }
 
@@ -700,5 +706,102 @@ impl AsRef<str> for LifecycleEvent {
             LifecycleEvent::NetworkIdle => "networkIdle",
             LifecycleEvent::NetworkAlmostIdle => "networkAlmostIdle",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn frame(loader: &str, url: &str) -> CdpFrame {
+        serde_json::from_value(json!({
+            "id": "MAIN", "loaderId": loader, "url": url,
+            "domainAndRegistry": "", "securityOrigin": "http://spa",
+            "mimeType": "text/html", "secureContextType": "InsecureScheme",
+            "crossOriginIsolatedContextType": "NotIsolated", "gatedAPIFeatures": []
+        }))
+        .unwrap()
+    }
+
+    fn event<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn lifecycle(name: &str, loader: &str) -> EventLifecycleEvent {
+        event(json!({"frameId": "MAIN", "loaderId": loader, "name": name, "timestamp": 1.0}))
+    }
+
+    /// A manager whose main frame shows `about:blank` and is being navigated.
+    fn navigating() -> FrameManager {
+        let mut fm = FrameManager::new(Duration::from_secs(30));
+        fm.on_frame_tree(FrameTree {
+            frame: frame("BLANK", "about:blank"),
+            child_frames: None,
+        });
+        fm.on_page_lifecycle_event(&lifecycle("init", "BLANK"));
+        fm.on_page_lifecycle_event(&lifecycle("load", "BLANK"));
+        fm.goto(FrameNavigationRequest::new(
+            NavigationId(1),
+            Request::new("Page.navigate".into(), json!({"url": "http://spa/"})),
+        ));
+        assert!(matches!(
+            fm.poll(Instant::now()),
+            Some(FrameEvent::NavigationRequest(NavigationId(1), _))
+        ));
+        fm
+    }
+
+    fn completed(fm: &mut FrameManager) -> bool {
+        matches!(
+            fm.poll(Instant::now()),
+            Some(FrameEvent::NavigationResult(Ok(_)))
+        )
+    }
+
+    /// The events a single-page app's navigation produced, in the order the
+    /// handler saw them: the document loads, and the app's own
+    /// `history.replaceState` then starts and stops "loading" the same
+    /// document, with its `frameStartedLoading` arriving last. Chrome sends
+    /// no further lifecycle event for the document, so if that start erased
+    /// `load`, the navigation never completed and `goto` waited out its
+    /// whole timeout on a page that had long finished.
+    #[test]
+    fn a_same_document_start_after_load_does_not_undo_the_navigation() {
+        let mut fm = navigating();
+        let main: FrameId = "MAIN".to_string().into();
+        fm.on_frame_started_loading(&event(json!({"frameId": "MAIN"})));
+        fm.on_page_lifecycle_event(&lifecycle("init", "DOC"));
+        fm.on_frame_navigated(&frame("DOC", "http://spa/"));
+        fm.on_page_lifecycle_event(&lifecycle("DOMContentLoaded", "DOC"));
+        fm.on_page_lifecycle_event(&lifecycle("load", "DOC"));
+        fm.on_frame_stopped_loading(&event(json!({"frameId": "MAIN"})));
+        fm.on_frame_navigated_within_document(&event(
+            json!({"frameId": "MAIN", "url": "http://spa/products", "navigationType": "historyApi"}),
+        ));
+        fm.on_frame_stopped_loading(&event(json!({"frameId": "MAIN"})));
+        fm.on_frame_started_loading(&event(json!({"frameId": "MAIN"})));
+        assert!(fm.frame(&main).unwrap().is_loaded());
+        assert!(
+            completed(&mut fm),
+            "the loaded document's navigation never completed"
+        );
+    }
+
+    /// A new document still has to arrive: `load` from the page being left
+    /// cannot complete a navigation to the next one.
+    #[test]
+    fn the_previous_documents_load_does_not_complete_a_new_navigation() {
+        let mut fm = navigating();
+        fm.on_frame_started_loading(&event(json!({"frameId": "MAIN"})));
+        assert!(!completed(&mut fm), "completed on about:blank's load");
+        fm.on_page_lifecycle_event(&lifecycle("init", "DOC"));
+        fm.on_page_lifecycle_event(&lifecycle("DOMContentLoaded", "DOC"));
+        assert!(
+            !completed(&mut fm),
+            "completed before the new document loaded"
+        );
+        fm.on_page_lifecycle_event(&lifecycle("load", "DOC"));
+        assert!(completed(&mut fm));
     }
 }
